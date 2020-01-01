@@ -6,11 +6,19 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Scalar/GVN.h"
 #include <algorithm>
+#include <cassert>
 #include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
@@ -47,7 +55,7 @@ static int gettok() {
         if (IdentifierStr == "def")
             return tok_def;
         if (IdentifierStr == "extern")
-            return tok_extern;
+                               return tok_extern;
         return tok_identifier;
     }
 
@@ -382,12 +390,14 @@ static void MainLoop() {
 
 static LLVMContext TheContext; // a lot of LLVM core data structures are owned in here
 // helper object, knows where to insert expressions, you just tell it which one
+// it automatically does local constant folding : a + 1 +2 --> a + 3
 static IRBuilder<> Builder(TheContext);
 // modules contain functions and global variables, they own memory, so we return Value* everywhere
 static std::unique_ptr<Module> TheModule;
 // keeps track of which values were defined in the current scope (symbol table)
 // function parameters will be here during codegen of function body.
 static std::map<std::string, Value*> NamedValues;
+static std::unique_ptr<legacy::FunctionPassManager> TheFPM;
 
 Value* LogErrorV(const char *Str) {
     LogError(Str);
@@ -486,6 +496,7 @@ Function* FunctionAST::codegen() {
     if (Value *RetVal = Body->codegen()) {
         Builder.CreateRet(RetVal);
         verifyFunction(*TheFunction);
+        TheFPM->run(*TheFunction);
         return TheFunction;
     }
 
@@ -499,6 +510,39 @@ Function* FunctionAST::codegen() {
      */
 }
 
+void InitializeModuleAndPassManager() {
+    // we will choose to run a few per-function optimizations as the user types the function in.
+    // If we wanted to make a “static Kaleidoscope compiler”, we would use exactly the code we
+    // have now, except that we would defer running the optimizer until the entire file
+    // has been parsed.
+
+    // XXX: This requires two transformations: reassociation of expressions (to make the 
+    // add’s lexically identical) and Common Subexpression Elimination (CSE) to delete
+    // the redundant add instruction.
+
+    TheModule = std::make_unique<Module>("my first JIT", TheContext);
+    TheFPM = std::make_unique<legacy::FunctionPassManager>(TheModule.get());
+
+    // Simple bit-twiddling optimization ("peephole" ?)
+    TheFPM->add(createInstructionCombiningPass());
+    TheFPM->add(createReassociatePass());
+    // Eliminate Common Subexpressions
+    TheFPM->add(createGVNPass());
+    // simplify the control flow (eg. delete unreachable statements)
+    TheFPM->add(createCFGSimplificationPass());
+    
+    // see the effect on
+    // def test(x) (1+2+x)*(x+(1+2));
+    
+    /*
+     * TODO XXX Another good source of ideas can come from looking at the passes that Clang runs to
+     * get started. The “opt” tool allows you to experiment with passes from the command line,
+     * so you can see if they do anything.
+     */
+
+    TheFPM->doInitialization();
+}
+
 int main() {
     // install standard binary operators
     BinopPrecedence['<'] = 10;
@@ -509,8 +553,7 @@ int main() {
     fprintf(stderr, "ready> ");
     getNextToken();
 
-    TheModule = std::make_unique<Module>("my first JIT", TheContext);
-
+    InitializeModuleAndPassManager();
     MainLoop();
 
     // all the generated code
